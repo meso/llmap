@@ -1,0 +1,83 @@
+name: Deploy
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: create D1
+        id: create_d1
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDirectory: 'proxy'
+          command: 'd1 create llmap_database'
+      - name: extract database id
+        id: extract_database_id
+        env:
+          OUTPUT: ${{ steps.create_d1.outputs.command-output }}
+        run: echo "database_id=$(echo $OUTPUT | grep database_id | sed 's/.*database_id = \"//; s/\".*//')" >> $GITHUB_OUTPUT
+      - name: deploy proxy
+        uses: cloudflare/wrangler-action@v3
+        id: deploy_proxy
+        env:
+          DATABASE_ID: ${{ steps.extract_database_id.outputs.database_id }}
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDirectory: 'proxy'
+          preCommands: envsubst < wrangler.toml.tmpl > wrangler.toml
+      - name: migrate database
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDirectory: 'proxy'
+          command: 'd1 execute llmap_database --file ../migrations/schema.sql --remote'
+      - name: create pages project
+        uses: cloudflare/wrangler-action@v3
+        id: create_project
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDirectory: 'web'
+          command: pages project create llmap --production-branch production
+      - name: deploy web
+        uses: cloudflare/wrangler-action@v3
+        id: deploy_web
+        env:
+          DATABASE_ID: ${{ steps.extract_database_id.outputs.database_id }}
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDirectory: 'web'
+          preCommands: |
+            envsubst < wrangler.toml.tmpl > wrangler.toml
+            rm package-lock.json
+            rm -rf node_modules
+            npm install
+            npm run build
+          command: pages deploy --branch=production
+      - name: extract url
+        id: extract_url
+        env:
+          OUTPUT: ${{ steps.create_project.outputs.command-output }}
+        run: echo "base_url=$(echo $OUTPUT | sed -n 's/.*\(http.*\.pages\.dev\).*/\1/p')" >> $GITHUB_OUTPUT
+      - name: set secrets
+        uses: cloudflare/wrangler-action@v3
+        env:
+          PROXY_URL: ${{ steps.deploy_proxy.outputs.deployment-url }}/
+          GOOGLE_CALLBACK_URL: ${{ steps.extract_url.outputs.base_url }}/auth/google/callback
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDirectory: 'web'
+          preCommands: |
+            envsubst < secrets.json > secrets.json.tmp
+          command: |
+            pages secret bulk secrets.json.tmp
+            
